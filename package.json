@@ -1,8 +1,7 @@
-
 {
   "name": "server",
   "version": "1.0.0",
-  "description": "",
+  "description": "# sistema-senha-backend",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
@@ -12,7 +11,16 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-  "express": "...",
-  "socket.io": "..."
-}
+    "express": "^4.18.2",
+    "socket.io": "^4.7.2"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NosbaoJ92/sistema-senha-backend.git"
+  },
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/NosbaoJ92/sistema-senha-backend/issues"
+  },
+  "homepage": "https://github.com/NosbaoJ92/sistema-senha-backend#readme"
 }

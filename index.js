@@ -1,130 +1,263 @@
-// server/index.js
-const express = require('express');
+// index.js
 const http = require('http');
+const express = require('express');
 const { Server } = require('socket.io');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 const server = http.createServer(app);
 
+// --- Configuração CORS ---
 const io = new Server(server, {
-  cors: {
-    origin: ['http://localhost:3000', 'http://127.0.0.1:3000'],
-    methods: ['GET', 'POST'],
-  },
+    cors: {
+        origin: "*",
+        methods: ["GET", "POST"]
+    }
 });
 
-// === ESTADO CENTRALIZADO ===
-let currentCalled = null; 
-let historyQueue = []; 
-let normalCount = 1;
-let priorityCount = 1;
-let normalQueue = []; 
+// =========================================================
+// VARIÁVEIS DE ESTADO GLOBAL
+// =========================================================
+let normalCounter = 0;
+let priorityCounter = 0;
+let normalQueue = [];
 let priorityQueue = [];
-let patientsWaiting = []; // Mapeamento de { ticket: 'N001', socketId: 'xyz123' }
+let lastCalledTickets = []; // Últimas senhas chamadas (Painel)
+let callHistory = []; // Histórico de senhas finalizadas
 
-// Função para formatar a senha (ex: N001, P005)
-const formatarSenha = (tipo, count) => {
-    return {
-        tipo: tipo === 'normal' ? 'N' : 'P',
-        numero: count.toString().padStart(3, '0')
+const MAX_PANEL_CALLS = 4;
+const MAX_HISTORY = 50;
+
+// =========================================================
+// FUNÇÃO AUXILIAR: Broadcast geral do estado
+// =========================================================
+function broadcastQueueState() {
+    const waitingQueueCombined = [...priorityQueue, ...normalQueue];
+    const state = {
+        normalQueue,
+        priorityQueue,
+        lastCalledTickets,
+        waitingQueue: waitingQueueCombined
     };
-};
+    io.emit('filas_atualizadas', state);
+    console.log(`[Broadcast] Filas atualizadas enviadas. Total em espera: ${waitingQueueCombined.length}`);
+}
 
-io.on('connection', (socket) => {
-  console.log('Um novo cliente se conectou:', socket.id);
+// =========================================================
+// FUNÇÃO DE GERAÇÃO DE RELATÓRIO DIÁRIO
+// =========================================================
+function gerarRelatorioDoDia() {
+    if (normalQueue.length === 0 && priorityQueue.length === 0 && callHistory.length === 0) {
+        console.log('⚠️ Nenhum dado para gerar relatório diário.');
+        return;
+    }
 
-  // 1. Enviar o estado inicial
-  socket.emit('estado_inicial', { 
-      currentCalled, 
-      historyQueue, 
-      normalQueue, 
-      priorityQueue 
-  });
+    const agora = new Date();
+    const dataFormatada = agora.toLocaleDateString('pt-BR');
+    const hora = agora.toLocaleTimeString('pt-BR');
 
-  // 2. RECEBER a emissão do Smartphone do Usuário (e guarda o ID do Socket)
-  socket.on('emitir_senha_usuario', (tipo, callback) => {
-    try {
-        let novaSenha;
-        
-        if (tipo === 'normal') {
-            novaSenha = formatarSenha('normal', normalCount);
-            normalQueue.push(novaSenha);
-            normalCount++;
-        } else if (tipo === 'prioritaria') {
-            novaSenha = formatarSenha('prioritaria', priorityCount);
-            priorityQueue.push(novaSenha);
-            priorityCount++;
-        } else {
-            return callback({ error: 'Tipo inválido' });
+    const totalNormal = normalQueue.length;
+    const totalPrioritaria = priorityQueue.length;
+
+    // --- Calcular tempos médios de espera ---
+    const tempos = [];
+    callHistory.forEach(ch => {
+        const emitida = normalQueue.find(n => `${n.tipo}${n.numero}` === `${ch.tipo === 'prioritaria' ? 'P' : 'N'}${ch.numero}`);
+        if (emitida) {
+            const diff = (new Date(ch.timestamp) - new Date(emitida.timestamp)) / 60000;
+            tempos.push(diff);
         }
+    });
 
-        // Mapeia a senha ao ID do Socket do paciente
-        patientsWaiting.push({
-            ticket: `${novaSenha.tipo}${novaSenha.numero}`,
-            socketId: socket.id
-        });
-        
-        // Notifica todos os operadores que a fila mudou
-        io.emit('filas_atualizadas', { normalQueue, priorityQueue });
+    const tempoMedio = tempos.length > 0
+        ? (tempos.reduce((a, b) => a + b, 0) / tempos.length).toFixed(2)
+        : 0;
 
-        callback(novaSenha); 
+    // --- Contagem por origem (manual/celular) ---
+    const geradasPorCelular = normalQueue.filter(s => s.origem === 'celular').length +
+                              priorityQueue.filter(s => s.origem === 'celular').length;
+    const geradasManualmente = normalQueue.filter(s => s.origem !== 'celular').length +
+                               priorityQueue.filter(s => s.origem !== 'celular').length;
 
-    } catch (error) {
-        console.error('Erro ao processar a emissão de senha:', error);
-        callback({ error: 'Erro interno do servidor ao emitir senha.' });
+    const relatorio = {
+        data: dataFormatada,
+        horaGeracao: hora,
+        totalSenhas: totalNormal + totalPrioritaria,
+        porTipo: {
+            normal: totalNormal,
+            prioritaria: totalPrioritaria
+        },
+        tempoMedioEspera: `${tempoMedio} minutos`,
+        geradasPorCelular,
+        geradasManualmente
+    };
+
+    const pasta = path.join(__dirname, 'relatorios');
+    if (!fs.existsSync(pasta)) fs.mkdirSync(pasta);
+
+    const filePath = path.join(pasta, `relatorio-${dataFormatada.replace(/\//g, '-')}.json`);
+    fs.writeFileSync(filePath, JSON.stringify(relatorio, null, 2), 'utf-8');
+
+    console.log(`✅ Relatório diário salvo: ${filePath}`);
+}
+
+// =========================================================
+// FUNÇÃO: Reiniciar contadores e filas (meia-noite)
+// =========================================================
+function resetarSistemaDiariamente() {
+    console.log('🔄 Reiniciando sistema diário...');
+    gerarRelatorioDoDia();
+
+    // Zera filas e contadores
+    normalCounter = 0;
+    priorityCounter = 0;
+    normalQueue = [];
+    priorityQueue = [];
+    lastCalledTickets = [];
+    callHistory = [];
+
+    broadcastQueueState();
+}
+
+// Verificação automática a cada minuto
+let ultimoDia = new Date().getDate();
+setInterval(() => {
+    const hoje = new Date().getDate();
+    if (hoje !== ultimoDia) {
+        resetarSistemaDiariamente();
+        ultimoDia = hoje;
     }
-  });
+}, 60000); // 1 minuto
 
-  // 3. RECEBER a chamada de senha do Operador
-  socket.on('chamar_senha', (data) => {
-    console.log('Chamada recebida:', data);
-    
-    currentCalled = data;
-    
-    historyQueue = [{ ...currentCalled, horario: Date.now() }, ...historyQueue].slice(0, 10);
+// =========================================================
+// SOCKET.IO - EVENTOS PRINCIPAIS
+// =========================================================
+io.on('connection', (socket) => {
+    console.log(`[Conexão] Novo cliente conectado: ${socket.id}`);
 
-    // ENVIA o novo estado do PAINEL para TODOS os clientes
-    io.emit('senha_chamada', { currentCalled, historyQueue });
-    
-    // ----------- LÓGICA DE NOTIFICAÇÃO DO PACIENTE -----------
-    const calledTicket = `${data.tipo}${data.numero}`;
-    
-    const patient = patientsWaiting.find(p => p.ticket === calledTicket);
+    // Estado inicial
+    const waitingQueueCombined = [...priorityQueue, ...normalQueue];
+    socket.emit('estado_inicial', {
+        normalQueue,
+        priorityQueue,
+        lastCalledTickets,
+        waitingQueue: waitingQueueCombined,
+        callHistory
+    });
 
-    if (patient) {
-        // O paciente NÃO é removido daqui, permitindo rechamadas
-        
-        // Envia uma notificação TARGETED para o celular do paciente
-        io.to(patient.socketId).emit('seu_guiche_chamado', {
-            guiche: data.guiche,
-            ticket: calledTicket 
-        });
-    }
-    // --------------------------------------------------------
-  });
+    // =====================================================
+    // 1. EMISSÃO DE SENHA
+    // =====================================================
+    socket.on('emitir_senha_usuario', (tipo, callback, origem = 'manual') => {
+        try {
+            if (tipo !== 'normal' && tipo !== 'prioritaria') {
+                const errMsg = 'Tipo de senha inválido.';
+                if (typeof callback === 'function') callback({ error: true, message: errMsg });
+                return;
+            }
 
-  // 4. Sincronização de filas após chamada do operador
-  socket.on('sincronizar_filas_apos_chamada', (data) => {
-      normalQueue = data.normalQueue;
-      priorityQueue = data.priorityQueue;
-      
-      // Notifica os outros operadores sobre a mudança de fila
-      socket.broadcast.emit('filas_atualizadas', { normalQueue, priorityQueue });
-  });
-  
-  // 5. NOVO EVENTO: Remove o paciente da lista de espera ao finalizar o atendimento
-  socket.on('finalizar_atendimento_paciente', (ticket) => {
-      patientsWaiting = patientsWaiting.filter(p => p.ticket !== ticket);
-  });
+            let numeroFormatado, newTicket = null;
 
-  socket.on('disconnect', () => {
-    console.log('Cliente desconectado:', socket.id);
-    // Remove da lista de espera se o paciente fechar o app
-    patientsWaiting = patientsWaiting.filter(p => p.socketId !== socket.id);
-  });
+            if (tipo === 'normal') {
+                normalCounter++;
+                numeroFormatado = String(normalCounter).padStart(3, '0');
+                newTicket = {
+                    tipo: 'N',
+                    numero: numeroFormatado,
+                    categoria: 'NORMAL',
+                    origem,
+                    hora: new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }),
+                    data: new Date().toLocaleDateString('pt-BR'),
+                    timestamp: Date.now()
+                };
+                normalQueue.push(newTicket);
+            } else {
+                priorityCounter++;
+                numeroFormatado = String(priorityCounter).padStart(3, '0');
+                newTicket = {
+                    tipo: 'P',
+                    numero: numeroFormatado,
+                    categoria: 'PRIORITÁRIA',
+                    origem,
+                    hora: new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }),
+                    data: new Date().toLocaleDateString('pt-BR'),
+                    timestamp: Date.now()
+                };
+                priorityQueue.push(newTicket);
+            }
+
+            console.log(`[Senha Emitida] ${newTicket.tipo}${newTicket.numero} (${origem})`);
+            broadcastQueueState();
+
+            if (typeof callback === 'function') {
+                callback({ success: true, ticket: newTicket, numero: newTicket.numero });
+            }
+        } catch (err) {
+            console.error("[Erro] Falha ao emitir senha:", err.message);
+            if (typeof callback === 'function') callback({ error: true, message: err.message });
+        }
+    });
+
+    // =====================================================
+    // 2. CHAMAR SENHA
+    // =====================================================
+    socket.on('chamar_senha', (callInfo) => {
+        const { tipo, numero, guiche } = callInfo;
+        const tipoPrefixado = tipo === 'prioritaria' ? 'P' : 'N';
+        const ticketId = `${tipoPrefixado}${numero}`;
+
+        io.emit('seu_guiche_chamado', { ticket: ticketId, guiche });
+
+        const currentCalled = {
+            tipo,
+            numero,
+            guiche,
+            timestamp: new Date().toISOString()
+        };
+
+        lastCalledTickets.unshift(currentCalled);
+        if (lastCalledTickets.length > MAX_PANEL_CALLS) lastCalledTickets.pop();
+
+        io.emit('senha_chamada', { currentCalled });
+        console.log(`[Chamada] Senha ${ticketId} chamada pelo Guichê ${guiche}.`);
+    });
+
+    // =====================================================
+    // 3. SINCRONIZAÇÃO DAS FILAS
+    // =====================================================
+    socket.on('sincronizar_filas_apos_chamada', (data) => {
+        normalQueue = Array.isArray(data.normalQueue) ? data.normalQueue : normalQueue;
+        priorityQueue = Array.isArray(data.priorityQueue) ? data.priorityQueue : priorityQueue;
+        broadcastQueueState();
+    });
+
+    // =====================================================
+    // 4. FINALIZAÇÃO DE ATENDIMENTO
+    // =====================================================
+    socket.on('finalizar_atendimento', (ticketInfo) => {
+        const { guiche, tipo, numero, timestamp } = ticketInfo;
+        const tipoPrefixado = tipo === 'prioritaria' ? 'P' : 'N';
+        const ticket = `${tipoPrefixado}${numero}`;
+
+        const newEntry = { guiche, ticket, tipo, numero, timestamp };
+        callHistory.unshift(newEntry);
+        if (callHistory.length > MAX_HISTORY) callHistory.pop();
+
+        io.emit('historico_adicionado', newEntry);
+        console.log(`[Finalizar] Atendimento finalizado: ${ticket} no Guichê ${guiche}`);
+    });
+
+    socket.on('disconnect', () => {
+        console.log(`[Desconexão] Cliente desconectado: ${socket.id}`);
+    });
 });
 
-const PORT = process.env.PORT || 3001;
-server.listen(PORT, () => {
-  console.log(`Servidor Socket.IO rodando na porta ${PORT}`);
+// =========================================================
+// INICIALIZAÇÃO DO SERVIDOR
+// =========================================================
+const PORT = 3001;
+server.listen(PORT, '0.0.0.0', () => {
+    console.log(`✅ Servidor Socket.IO rodando em todos os IPs locais na porta ${PORT}`);
+    console.log('Aguardando conexões de clientes...');
 });
