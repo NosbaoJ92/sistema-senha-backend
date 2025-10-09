@@ -1,4 +1,3 @@
-// index.js
 const http = require('http');
 const express = require('express');
 const { Server } = require('socket.io');
@@ -23,8 +22,8 @@ let normalCounter = 0;
 let priorityCounter = 0;
 let normalQueue = [];
 let priorityQueue = [];
-let lastCalledTickets = []; // Últimas senhas chamadas (Painel)
-let callHistory = []; // Histórico de senhas finalizadas
+let lastCalledTickets = [];
+let callHistory = [];
 
 const MAX_PANEL_CALLS = 4;
 const MAX_HISTORY = 50;
@@ -60,7 +59,6 @@ function gerarRelatorioDoDia() {
     const totalNormal = normalQueue.length;
     const totalPrioritaria = priorityQueue.length;
 
-    // --- Calcular tempos médios de espera ---
     const tempos = [];
     callHistory.forEach(ch => {
         const emitida = normalQueue.find(n => `${n.tipo}${n.numero}` === `${ch.tipo === 'prioritaria' ? 'P' : 'N'}${ch.numero}`);
@@ -74,7 +72,6 @@ function gerarRelatorioDoDia() {
         ? (tempos.reduce((a, b) => a + b, 0) / tempos.length).toFixed(2)
         : 0;
 
-    // --- Contagem por origem (manual/celular) ---
     const geradasPorCelular = normalQueue.filter(s => s.origem === 'celular').length +
                               priorityQueue.filter(s => s.origem === 'celular').length;
     const geradasManualmente = normalQueue.filter(s => s.origem !== 'celular').length +
@@ -109,7 +106,6 @@ function resetarSistemaDiariamente() {
     console.log('🔄 Reiniciando sistema diário...');
     gerarRelatorioDoDia();
 
-    // Zera filas e contadores
     normalCounter = 0;
     priorityCounter = 0;
     normalQueue = [];
@@ -128,7 +124,7 @@ setInterval(() => {
         resetarSistemaDiariamente();
         ultimoDia = hoje;
     }
-}, 60000); // 1 minuto
+}, 60000);
 
 // =========================================================
 // SOCKET.IO - EVENTOS PRINCIPAIS
@@ -136,86 +132,67 @@ setInterval(() => {
 io.on('connection', (socket) => {
     console.log(`[Conexão] Novo cliente conectado: ${socket.id}`);
 
-    // Estado inicial
-    const waitingQueueCombined = [...priorityQueue, ...normalQueue];
     socket.emit('estado_inicial', {
         normalQueue,
         priorityQueue,
         lastCalledTickets,
-        waitingQueue: waitingQueueCombined,
+        waitingQueue: [...priorityQueue, ...normalQueue],
         callHistory
     });
 
-    // =====================================================
     // 1. EMISSÃO DE SENHA
-    // =====================================================
     socket.on('emitir_senha_usuario', (tipo, callback, origem = 'manual') => {
-        try {
-            if (tipo !== 'normal' && tipo !== 'prioritaria') {
-                const errMsg = 'Tipo de senha inválido.';
-                if (typeof callback === 'function') callback({ error: true, message: errMsg });
-                return;
-            }
+        if (tipo !== 'normal' && tipo !== 'prioritaria') {
+            if (typeof callback === 'function') callback({ error: true, message: 'Tipo de senha inválido.' });
+            return;
+        }
 
-            let numeroFormatado, newTicket = null;
+        let numeroFormatado, newTicket = null;
 
-            if (tipo === 'normal') {
-                normalCounter++;
-                numeroFormatado = String(normalCounter).padStart(3, '0');
-                newTicket = {
-                    tipo: 'N',
-                    numero: numeroFormatado,
-                    categoria: 'NORMAL',
-                    origem,
-                    hora: new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }),
-                    data: new Date().toLocaleDateString('pt-BR'),
-                    timestamp: Date.now()
-                };
-                normalQueue.push(newTicket);
-            } else {
-                priorityCounter++;
-                numeroFormatado = String(priorityCounter).padStart(3, '0');
-                newTicket = {
-                    tipo: 'P',
-                    numero: numeroFormatado,
-                    categoria: 'PRIORITÁRIA',
-                    origem,
-                    hora: new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }),
-                    data: new Date().toLocaleDateString('pt-BR'),
-                    timestamp: Date.now()
-                };
-                priorityQueue.push(newTicket);
-            }
+        if (tipo === 'normal') {
+            normalCounter++;
+            numeroFormatado = String(normalCounter).padStart(3, '0');
+            newTicket = {
+                tipo: 'N',
+                numero: numeroFormatado,
+                categoria: 'NORMAL',
+                origem,
+                hora: new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }),
+                data: new Date().toLocaleDateString('pt-BR'),
+                timestamp: Date.now()
+            };
+            normalQueue.push(newTicket);
+        } else {
+            priorityCounter++;
+            numeroFormatado = String(priorityCounter).padStart(3, '0');
+            newTicket = {
+                tipo: 'P',
+                numero: numeroFormatado,
+                categoria: 'PRIORITÁRIA',
+                origem,
+                hora: new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }),
+                data: new Date().toLocaleDateString('pt-BR'),
+                timestamp: Date.now()
+            };
+            priorityQueue.push(newTicket);
+        }
 
-            console.log(`[Senha Emitida] ${newTicket.tipo}${newTicket.numero} (${origem})`);
-            broadcastQueueState();
+        console.log(`[Senha Emitida] ${newTicket.tipo}${newTicket.numero} (${origem})`);
+        broadcastQueueState();
 
-            if (typeof callback === 'function') {
-                callback({ success: true, ticket: newTicket, numero: newTicket.numero });
-            }
-        } catch (err) {
-            console.error("[Erro] Falha ao emitir senha:", err.message);
-            if (typeof callback === 'function') callback({ error: true, message: err.message });
+        if (typeof callback === 'function') {
+            callback({ success: true, ticket: newTicket, numero: newTicket.numero });
         }
     });
 
-    // =====================================================
     // 2. CHAMAR SENHA
-    // =====================================================
-    socket.on('chamar_senha', (callInfo) => {
-        const { tipo, numero, guiche } = callInfo;
+    socket.on('chamar_senha', ({ tipo, numero, guiche }) => {
         const tipoPrefixado = tipo === 'prioritaria' ? 'P' : 'N';
         const ticketId = `${tipoPrefixado}${numero}`;
 
         io.emit('seu_guiche_chamado', { ticket: ticketId, guiche });
 
-        const currentCalled = {
-            tipo,
-            numero,
-            guiche,
-            timestamp: new Date().toISOString()
-        };
-
+        const currentCalled = { tipo, numero, guiche, timestamp: new Date().toISOString() };
         lastCalledTickets.unshift(currentCalled);
         if (lastCalledTickets.length > MAX_PANEL_CALLS) lastCalledTickets.pop();
 
@@ -223,20 +200,15 @@ io.on('connection', (socket) => {
         console.log(`[Chamada] Senha ${ticketId} chamada pelo Guichê ${guiche}.`);
     });
 
-    // =====================================================
     // 3. SINCRONIZAÇÃO DAS FILAS
-    // =====================================================
     socket.on('sincronizar_filas_apos_chamada', (data) => {
         normalQueue = Array.isArray(data.normalQueue) ? data.normalQueue : normalQueue;
         priorityQueue = Array.isArray(data.priorityQueue) ? data.priorityQueue : priorityQueue;
         broadcastQueueState();
     });
 
-    // =====================================================
     // 4. FINALIZAÇÃO DE ATENDIMENTO
-    // =====================================================
-    socket.on('finalizar_atendimento', (ticketInfo) => {
-        const { guiche, tipo, numero, timestamp } = ticketInfo;
+    socket.on('finalizar_atendimento', ({ guiche, tipo, numero, timestamp }) => {
         const tipoPrefixado = tipo === 'prioritaria' ? 'P' : 'N';
         const ticket = `${tipoPrefixado}${numero}`;
 
@@ -256,8 +228,7 @@ io.on('connection', (socket) => {
 // =========================================================
 // INICIALIZAÇÃO DO SERVIDOR
 // =========================================================
-const PORT = 3001;
+const PORT = process.env.PORT || 3001;
 server.listen(PORT, '0.0.0.0', () => {
-    console.log(`✅ Servidor Socket.IO rodando em todos os IPs locais na porta ${PORT}`);
-    console.log('Aguardando conexões de clientes...');
+    console.log(`✅ Servidor Socket.IO rodando na porta ${PORT}`);
 });
